@@ -1,0 +1,2441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LUMENFALL — Neon Survivor</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05070f; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* Read aloud, never shown: the status line screen readers announce. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Lumenfall, a neon arena survival game: move with WASD or arrow keys, dash with Space, collect shards and level up to survive ten waves"></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script type="module">
+
+// ---- config.js ----
+// LUMENFALL — Neon Survivor. Every tuning number and colour in one place.
+// The playfield is a fixed 1280x720 logical arena; the renderer scales it to the
+// window, so no rule below depends on the screen size.
+const FIELD = { width: 1280, height: 720 };
+
+/** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
+const STEP = 1 / 60;
+
+/** One wave lasts this long (seconds); waves 5 and 10 end early when their boss dies. */
+const WAVE_SECONDS = 42;
+/** The last wave. Defeating its boss wins the game. */
+const FINAL_WAVE = 10;
+/** Short breather between waves, in seconds. */
+const INTERMISSION_SECONDS = 4;
+
+const PLAYER = {
+  radius: 14,
+  speed: 265,
+  maxHp: 100,
+  dashSpeed: 720,
+  dashTime: 0.16,
+  dashCooldown: 2.2,
+  dashInvuln: 0.35,
+  pickupRadius: 26,
+  magnetRadius: 110,
+  contactDamage: 0,
+};
+
+const ENEMY = {
+  // drifter: slow chaser. skitter: fast and fragile. spitter: keeps its distance, shoots orbs.
+  // brute: slow, tough, hits hard. warden: wave-5 boss. hollowStar: wave-10 boss.
+  drifter: { radius: 14, hp: 22, speed: 78, damage: 10, xp: 1, score: 10, color: '#ff5d73' },
+  skitter: { radius: 10, hp: 12, speed: 158, damage: 7, xp: 1, score: 15, color: '#ffb02e' },
+  spitter: { radius: 13, hp: 26, speed: 62, damage: 8, xp: 2, score: 20, color: '#c77dff' },
+  brute: { radius: 22, hp: 95, speed: 48, damage: 18, xp: 3, score: 30, color: '#ff3d81' },
+  warden: { radius: 34, hp: 950, speed: 56, damage: 22, xp: 25, score: 500, color: '#ff2e63' },
+  hollowStar: { radius: 44, hp: 2400, speed: 62, damage: 26, xp: 60, score: 2000, color: '#f8f32b' },
+};
+
+/** Spawn budget and mix per wave. count grows; elites appear from wave 3. */
+function wavePlan(wave) {
+  return {
+    count: 14 + wave * 9,
+    interval: Math.max(0.32, 1.15 - wave * 0.07),
+    eliteEvery: wave >= 3 ? Math.max(6, 12 - wave) : 0,
+    brutes: wave >= 2 ? 1 + Math.floor(wave / 2) : 0,
+    spitters: wave >= 2 ? Math.floor(wave / 2) : 0,
+  };
+}
+
+/** XP needed to reach the next level (level is 1-based). */
+function xpForLevel(level) {
+  return Math.floor(6 + (level - 1) * 5 + (level - 1) * (level - 1) * 0.9);
+}
+
+/** How many enemies, shards, projectiles, particles and damage numbers can exist at once. */
+const POOL = { enemies: 200, shards: 260, shots: 320, orbs: 120, particles: 420, numbers: 48 };
+
+const COMBO = { window: 2.5, perKill: 0.06, maxMult: 3 };
+
+const PALETTE = {
+  backdrop: '#05070f',
+  arena: '#0a0f22',
+  arenaEdge: '#1b2b52',
+  grid: '#111a38',
+  player: '#39f5d6',
+  playerCore: '#eafffb',
+  shard: '#7df9ff',
+  shardBig: '#ffd166',
+  panel: '#0d1329',
+  panelEdge: '#2b3f7a',
+  text: '#eef3ff',
+  muted: '#93a1c6',
+  gold: '#ffd166',
+  danger: '#ff5d73',
+  heal: '#5dffa0',
+  boss: '#f8f32b',
+};
+
+const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+
+/** Where the best score is kept between visits (this browser only). */
+const BEST_KEY = 'lumenfall.best';
+/** Where the best wave reached is kept. */
+const BEST_WAVE_KEY = 'lumenfall.bestWave';
+
+// ---- random.js ----
+// A small seeded random number generator (mulberry32): the same seed gives the same
+// game, which is what makes the screenshot scenes repeatable.
+function createRandom(seed) {
+  let a = seed | 0;
+  return function random() {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Pick one entry from a weighted table of { value, weight } using `random`. */
+function pickWeighted(random, table) {
+  let total = 0;
+  for (const entry of table) total += entry.weight;
+  let roll = random() * total;
+  for (const entry of table) {
+    roll -= entry.weight;
+    if (roll <= 0) return entry.value;
+  }
+  return table[table.length - 1].value;
+}
+
+// ---- input.js ----
+// Keyboard, mouse and touch input. Held keys give a movement vector; one-shot
+// presses (confirm, pause, dash, mute, restart, upgrade picks) are queued as bit
+// flags and taken once by the loop, so a press between two frames is never lost
+// and never counted twice. Pointer position is tracked for menus and aiming.
+const ACTION_CONFIRM = 1;
+const ACTION_PAUSE = 2;
+const ACTION_DASH = 4;
+const ACTION_MUTE = 8;
+const ACTION_RESTART = 16;
+const ACTION_HOWTO = 32;
+
+const UP = new Set(['ArrowUp', 'KeyW']);
+const DOWN = new Set(['ArrowDown', 'KeyS']);
+const LEFT = new Set(['ArrowLeft', 'KeyA']);
+const RIGHT = new Set(['ArrowRight', 'KeyD']);
+const CONFIRM = new Set(['Enter']);
+// Space is both: confirm on menus, dash while playing. The main loop only
+// acts on the confirm flag on menu screens and only dashes on the play
+// screen, so one key doing both is unambiguous — and the HUD promises
+// "DASH READY [SPACE]".
+const CONFIRM_AND_DASH = new Set(['Space']);
+const PAUSE = new Set(['KeyP', 'Escape']);
+const DASH = new Set(['ShiftLeft', 'ShiftRight']);
+const MUTE = new Set(['KeyM']);
+const RESTART = new Set(['KeyR']);
+const HOWTO = new Set(['KeyH']);
+const PICK = new Set(['Digit1', 'Digit2', 'Digit3']);
+
+function createInput(canvas) {
+  const held = { up: false, down: false, left: false, right: false };
+  let actions = 0;
+  let pick = 0; // 1..3, consumed once
+  const pointer = { x: 0, y: 0, down: false, clicked: false };
+  let clickX = 0;
+  let clickY = 0;
+
+  function keyDown(event) {
+    const code = event.code;
+    if (UP.has(code)) held.up = true;
+    else if (DOWN.has(code)) held.down = true;
+    else if (LEFT.has(code)) held.left = true;
+    else if (RIGHT.has(code)) held.right = true;
+    else if (CONFIRM.has(code)) { if (!event.repeat) actions |= ACTION_CONFIRM; }
+    else if (CONFIRM_AND_DASH.has(code)) { if (!event.repeat) actions |= ACTION_CONFIRM | ACTION_DASH; }
+    else if (PAUSE.has(code)) { if (!event.repeat) actions |= ACTION_PAUSE; }
+    else if (DASH.has(code)) { if (!event.repeat) actions |= ACTION_DASH; }
+    else if (MUTE.has(code)) { if (!event.repeat) actions |= ACTION_MUTE; }
+    else if (RESTART.has(code)) { if (!event.repeat) actions |= ACTION_RESTART; }
+    else if (HOWTO.has(code)) { if (!event.repeat) actions |= ACTION_HOWTO; }
+    else if (PICK.has(code)) { if (!event.repeat) pick = Number(code.slice(-1)); }
+    else return;
+    event.preventDefault();
+  }
+  function keyUp(event) {
+    const code = event.code;
+    if (UP.has(code)) held.up = false;
+    else if (DOWN.has(code)) held.down = false;
+    else if (LEFT.has(code)) held.left = false;
+    else if (RIGHT.has(code)) held.right = false;
+  }
+
+  window.addEventListener('keydown', keyDown);
+  window.addEventListener('keyup', keyUp);
+  window.addEventListener('blur', () => {
+    held.up = held.down = held.left = held.right = false;
+  });
+  canvas.addEventListener('pointermove', (event) => {
+    const rect = canvas.getBoundingClientRect();
+    pointer.x = event.clientX - rect.left;
+    pointer.y = event.clientY - rect.top;
+  });
+  canvas.addEventListener('pointerdown', (event) => {
+    const rect = canvas.getBoundingClientRect();
+    pointer.x = event.clientX - rect.left;
+    pointer.y = event.clientY - rect.top;
+    pointer.down = true;
+    pointer.clicked = true;
+    clickX = pointer.x;
+    clickY = pointer.y;
+  });
+  window.addEventListener('pointerup', () => { pointer.down = false; });
+
+  return {
+    pointer,
+    /** Normalised movement vector {x, y} from held keys. */
+    move() {
+      const x = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+      const y = (held.down ? 1 : 0) - (held.up ? 1 : 0);
+      if (x === 0 && y === 0) return { x: 0, y: 0 };
+      const len = Math.hypot(x, y);
+      return { x: x / len, y: y / len };
+    },
+    /** The one-shot presses since the last call, as ACTION_* flags. */
+    takeActions() {
+      const taken = actions;
+      actions = 0;
+      return taken;
+    },
+    /** The upgrade pick (1..3) since the last call, or 0. */
+    takePick() {
+      const taken = pick;
+      pick = 0;
+      return taken;
+    },
+    /** The last click position since the last call, or null. Consumed once. */
+    takeClick() {
+      if (!pointer.clicked) return null;
+      pointer.clicked = false;
+      return { x: clickX, y: clickY };
+    },
+  };
+}
+
+// ---- audio.js ----
+// All sound is synthesised with WebAudio: no audio files, no network. A tiny
+// generative music loop (bass pulse + pentatonic arpeggio, A minor) runs under
+// short effects for shooting, hits, pickups, level-ups, dashes and boss events.
+// Audio starts only after the first user gesture, as browsers require.
+function createAudio() {
+  let context = null;
+  let master = null;
+  let musicGain = null;
+  let muted = false;
+  let musicTimer = null;
+  let nextNote = 0;
+  let step = 0;
+
+  // A minor pentatonic, two octaves up from A3.
+  const SCALE = [220, 261.63, 293.66, 329.63, 392, 440, 523.25, 587.33, 659.25, 784];
+  const BASS = [55, 55, 65.41, 49];
+
+  function ensure() {
+    if (context) {
+      if (context.state === 'suspended') context.resume().catch(() => {});
+      return true;
+    }
+    try {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return false;
+      context = new Ctor();
+      master = context.createGain();
+      master.gain.value = 0.5;
+      master.connect(context.destination);
+      musicGain = context.createGain();
+      musicGain.gain.value = 0.16;
+      musicGain.connect(master);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function tone(freq, dur, type, vol, when = 0, slideTo = 0) {
+    if (!context || muted) return;
+    const t0 = context.currentTime + when;
+    const osc = context.createOscillator();
+    const gain = context.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(Math.max(20, freq), t0);
+    if (slideTo > 0) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(master);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  }
+
+  function scheduleMusic() {
+    if (!context || muted) return;
+    const spb = 60 / 112 / 2; // eighth notes at 112 BPM
+    while (nextNote < context.currentTime + 0.4) {
+      const bar = Math.floor(step / 8) % 4;
+      const beat = step % 8;
+      if (beat === 0) {
+        const f = BASS[bar];
+        const osc = context.createOscillator();
+        const gain = context.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.5, nextNote);
+        gain.gain.exponentialRampToValueAtTime(0.001, nextNote + spb * 1.9);
+        osc.connect(gain); gain.connect(musicGain);
+        osc.start(nextNote); osc.stop(nextNote + spb * 2);
+      }
+      if (beat % 2 === 0) {
+        const idx = (step * 7 + bar * 3) % SCALE.length;
+        const osc = context.createOscillator();
+        const gain = context.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = SCALE[idx];
+        gain.gain.setValueAtTime(0.22, nextNote);
+        gain.gain.exponentialRampToValueAtTime(0.001, nextNote + spb * 1.4);
+        osc.connect(gain); gain.connect(musicGain);
+        osc.start(nextNote); osc.stop(nextNote + spb * 1.5);
+      }
+      nextNote += spb;
+      step += 1;
+    }
+  }
+
+  return {
+    get muted() { return muted; },
+    /** Call from any user gesture; starts the context and the music loop. */
+    unlock() {
+      if (!ensure()) return;
+      if (musicTimer === null) {
+        nextNote = context.currentTime + 0.1;
+        musicTimer = window.setInterval(scheduleMusic, 120);
+      }
+    },
+    toggleMute() {
+      muted = !muted;
+      if (master) master.gain.value = muted ? 0 : 0.5;
+      return muted;
+    },
+    shoot() { tone(880 + Math.random() * 120, 0.07, 'square', 0.05, 0, 520); },
+    hit() { tone(180, 0.06, 'sawtooth', 0.08, 0, 90); },
+    kill() { tone(320, 0.12, 'triangle', 0.12, 0, 60); },
+    pickup() { tone(660 + Math.random() * 80, 0.09, 'sine', 0.10, 0, 1320); },
+    dash() { tone(300, 0.14, 'sine', 0.10, 0, 900); },
+    hurt() { tone(140, 0.22, 'sawtooth', 0.16, 0, 55); },
+    levelUp() {
+      [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(f, 0.18, 'triangle', 0.14, i * 0.07));
+    },
+    boss() {
+      tone(98, 0.7, 'sawtooth', 0.18, 0, 49);
+      tone(147, 0.7, 'sawtooth', 0.12, 0.05, 73);
+    },
+    victory() {
+      [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => tone(f, 0.3, 'triangle', 0.15, i * 0.11));
+    },
+    gameOver() {
+      [392, 329.63, 261.63, 196].forEach((f, i) => tone(f, 0.35, 'triangle', 0.13, i * 0.14));
+    },
+  };
+}
+
+// ---- particles.js ----
+// Particles and floating damage numbers. Both are fixed pools allocated once,
+// so a busy fight allocates nothing.
+
+function createParticles() {
+  const list = [];
+  for (let i = 0; i < POOL.particles; i += 1) {
+    list.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 1, size: 2, color: '#fff', drag: 0.9, glow: false });
+  }
+  const numbers = [];
+  for (let i = 0; i < POOL.numbers; i += 1) {
+    numbers.push({ active: false, x: 0, y: 0, life: 0, maxLife: 1, text: '', color: '#fff', size: 14 });
+  }
+
+  function spawn(x, y, vx, vy, life, size, color, glow = true) {
+    for (const p of list) {
+      if (p.active) continue;
+      p.active = true;
+      p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+      p.life = life; p.maxLife = life; p.size = size; p.color = color; p.glow = glow;
+      return;
+    }
+  }
+
+  return {
+    list,
+    numbers,
+    burst(x, y, color, count, speed = 180, size = 3) {
+      for (let i = 0; i < count; i += 1) {
+        const a = Math.random() * Math.PI * 2;
+        const s = speed * (0.3 + Math.random() * 0.7);
+        spawn(x, y, Math.cos(a) * s, Math.sin(a) * s, 0.35 + Math.random() * 0.4, size * (0.6 + Math.random() * 0.8), color);
+      }
+    },
+    ring(x, y, color, count = 26, speed = 260) {
+      for (let i = 0; i < count; i += 1) {
+        const a = (i / count) * Math.PI * 2;
+        spawn(x, y, Math.cos(a) * speed, Math.sin(a) * speed, 0.5, 3.5, color);
+      }
+    },
+    trail(x, y, color) {
+      spawn(x, y, (Math.random() - 0.5) * 30, (Math.random() - 0.5) * 30, 0.3, 2.5, color);
+    },
+    damageNumber(x, y, value, color = '#fff', size = 14) {
+      for (const n of numbers) {
+        if (n.active) continue;
+        n.active = true;
+        n.x = x + (Math.random() - 0.5) * 14; n.y = y - 6;
+        n.life = 0.8; n.maxLife = 0.8;
+        n.text = String(Math.round(value)); n.color = color; n.size = size;
+        return;
+      }
+    },
+    step(dt) {
+      for (const p of list) {
+        if (!p.active) continue;
+        p.life -= dt;
+        if (p.life <= 0) { p.active = false; continue; }
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.vx *= 0.92; p.vy *= 0.92;
+      }
+      for (const n of numbers) {
+        if (!n.active) continue;
+        n.life -= dt;
+        if (n.life <= 0) { n.active = false; continue; }
+        n.y -= 42 * dt;
+      }
+    },
+    clear() {
+      for (const p of list) p.active = false;
+      for (const n of numbers) n.active = false;
+    },
+  };
+}
+
+// ---- weapons.js ----
+// The five weapons. Each is auto-firing: the player moves and dodges, the
+// arsenal does the shooting. A weapon has a level (1..5); levelling it up
+// raises its damage, count or rate as its `perLevel` table says.
+const WEAPON_DEFS = {
+  blaster: {
+    name: 'Pulse Blaster', icon: '◈', color: '#39f5d6',
+    blurb: 'Fires plasma bolts at the nearest foe.',
+    base: { damage: 14, rate: 2.6, count: 1, speed: 520 },
+    perLevel: { damage: 6, rate: 0.35, count: 0 },
+    countAt: (level) => (level >= 4 ? 3 : level >= 2 ? 2 : 1),
+  },
+  blades: {
+    name: 'Orbit Blades', icon: '✦', color: '#ffd166',
+    blurb: 'Blades circle you, shredding what they touch.',
+    base: { damage: 12, rate: 0, count: 2, speed: 260 },
+    perLevel: { damage: 5, rate: 0, count: 0 },
+    countAt: (level) => 1 + level,
+  },
+  nova: {
+    name: 'Nova Burst', icon: '✺', color: '#ff5d73',
+    blurb: 'A shockwave erupts around you every few seconds.',
+    base: { damage: 26, rate: 0.42, count: 1, speed: 0 },
+    perLevel: { damage: 12, rate: 0.07, count: 0 },
+    countAt: () => 1,
+  },
+  lightning: {
+    name: 'Chain Lightning', icon: '⚡', color: '#7df9ff',
+    blurb: 'Lightning arcs between the nearest foes.',
+    base: { damage: 20, rate: 0.8, count: 3, speed: 0 },
+    perLevel: { damage: 9, rate: 0.12, count: 0 },
+    countAt: (level) => 2 + Math.floor(level / 2),
+  },
+  frost: {
+    name: 'Frost Field', icon: '❄', color: '#a5b4ff',
+    blurb: 'A freezing aura slows and bites nearby foes.',
+    base: { damage: 7, rate: 2, count: 1, speed: 0 },
+    perLevel: { damage: 3, rate: 0.25, count: 0 },
+    countAt: () => 1,
+  },
+};
+
+const MAX_WEAPON_LEVEL = 5;
+
+/** A fresh weapon instance at level 1. */
+function makeWeapon(id) {
+  return { id, level: 1, cooldown: 0.4, angle: 0, tick: 0 };
+}
+
+/** Effective stats of a weapon at its level, with the player's damage/fire-rate multipliers applied. */
+function weaponStats(weapon, damageMul, rateMul) {
+  const def = WEAPON_DEFS[weapon.id];
+  const lvl = weapon.level - 1;
+  return {
+    damage: (def.base.damage + def.perLevel.damage * lvl) * damageMul,
+    rate: (def.base.rate + def.perLevel.rate * lvl) * rateMul,
+    count: def.countAt(weapon.level),
+    speed: def.base.speed,
+  };
+}
+
+// ---- upgrades.js ----
+// Level-up choices. A choice is a card: a new weapon, a weapon level, or a
+// stat boost. rollChoices picks 3 distinct cards the player can still use.
+
+const STAT_CHOICES = [
+  { kind: 'stat', stat: 'maxHp', name: 'Reinforced Core', icon: '♥', blurb: '+25 max HP and heal 25.', color: '#5dffa0' },
+  { kind: 'stat', stat: 'speed', name: 'Ion Thrusters', icon: '»', blurb: '+12% move speed.', color: '#7df9ff' },
+  { kind: 'stat', stat: 'magnet', name: 'Shard Magnet', icon: '◎', blurb: '+45% pickup radius.', color: '#ffd166' },
+  { kind: 'stat', stat: 'damage', name: 'Overcharge', icon: '▲', blurb: '+15% weapon damage.', color: '#ff5d73' },
+  { kind: 'stat', stat: 'fireRate', name: 'Rapid Cycler', icon: '≋', blurb: '+12% fire rate.', color: '#c77dff' },
+  { kind: 'stat', stat: 'dash', name: 'Phase Dash', icon: '↯', blurb: 'Dash recharges 25% faster.', color: '#39f5d6' },
+];
+
+/**
+ * Roll 3 distinct level-up cards for the player. Weapons the player owns can
+ * appear as an upgrade until level 5; new weapons appear until all five are held.
+ */
+function rollChoices(random, weapons) {
+  const pool = [];
+  for (const id of Object.keys(WEAPON_DEFS)) {
+    const owned = weapons.find((w) => w.id === id);
+    if (!owned) {
+      pool.push({ kind: 'newWeapon', weapon: id, name: WEAPON_DEFS[id].name, icon: WEAPON_DEFS[id].icon, blurb: WEAPON_DEFS[id].blurb, color: WEAPON_DEFS[id].color });
+    } else if (owned.level < MAX_WEAPON_LEVEL) {
+      pool.push({ kind: 'upgradeWeapon', weapon: id, name: `${WEAPON_DEFS[id].name} II+`, icon: WEAPON_DEFS[id].icon, blurb: `Raise ${WEAPON_DEFS[id].name} to level ${owned.level + 1}.`, color: WEAPON_DEFS[id].color });
+    }
+  }
+  for (const s of STAT_CHOICES) pool.push({ ...s });
+  const picks = [];
+  const bag = [...pool];
+  while (picks.length < 3 && bag.length > 0) {
+    const i = Math.floor(random() * bag.length);
+    picks.push(bag.splice(i, 1)[0]);
+  }
+  return picks;
+}
+
+/** Apply a chosen card to the player object. Returns a short label for the log. */
+function applyChoice(player, choice) {
+  if (choice.kind === 'newWeapon') {
+    player.weapons.push(makeWeapon(choice.weapon));
+    return `${WEAPON_DEFS[choice.weapon].name} acquired!`;
+  }
+  if (choice.kind === 'upgradeWeapon') {
+    const w = player.weapons.find((x) => x.id === choice.weapon);
+    if (w) w.level = Math.min(MAX_WEAPON_LEVEL, w.level + 1);
+    return `${WEAPON_DEFS[choice.weapon].name} → level ${w ? w.level : 1}`;
+  }
+  if (choice.stat === 'maxHp') {
+    player.maxHp += 25;
+    player.hp = Math.min(player.maxHp, player.hp + 25);
+  } else if (choice.stat === 'speed') player.speedMul *= 1.12;
+  else if (choice.stat === 'magnet') player.magnetMul *= 1.45;
+  else if (choice.stat === 'damage') player.damageMul *= 1.15;
+  else if (choice.stat === 'fireRate') player.rateMul *= 1.12;
+  else if (choice.stat === 'dash') player.dashCooldownMul *= 0.75;
+  return choice.name;
+}
+
+// ---- enemies.js ----
+// Enemies: spawning, movement and contact. Each enemy is one pooled object;
+// the world owns the pools, this module owns the per-type behaviour.
+
+
+const KIND = {
+  drifter: 'drifter',
+  skitter: 'skitter',
+  spitter: 'spitter',
+  brute: 'brute',
+  warden: 'warden',
+  hollowStar: 'hollowStar',
+};
+
+const MIX = {
+  1: [{ value: 'drifter', weight: 10 }, { value: 'skitter', weight: 3 }],
+  2: [{ value: 'drifter', weight: 8 }, { value: 'skitter', weight: 5 }, { value: 'spitter', weight: 2 }],
+  3: [{ value: 'drifter', weight: 7 }, { value: 'skitter', weight: 6 }, { value: 'spitter', weight: 3 }, { value: 'brute', weight: 2 }],
+  4: [{ value: 'drifter', weight: 6 }, { value: 'skitter', weight: 6 }, { value: 'spitter', weight: 4 }, { value: 'brute', weight: 3 }],
+  5: [{ value: 'drifter', weight: 5 }, { value: 'skitter', weight: 6 }, { value: 'spitter', weight: 4 }, { value: 'brute', weight: 4 }],
+};
+
+function mixFor(wave) {
+  return MIX[Math.min(wave, 5)];
+}
+
+/** Spawn position just outside a random arena edge. */
+function spawnEdge(random) {
+  const side = Math.floor(random() * 4);
+  const m = 30;
+  if (side === 0) return { x: random() * FIELD.width, y: -m };
+  if (side === 1) return { x: FIELD.width + m, y: random() * FIELD.height };
+  if (side === 2) return { x: random() * FIELD.width, y: FIELD.height + m };
+  return { x: -m, y: random() * FIELD.height };
+}
+
+function pickKind(random, wave) {
+  return pickWeighted(random, mixFor(wave));
+}
+
+/** Fill a pooled enemy object as a fresh enemy of `kind` at `x, y`. */
+function initEnemy(e, kind, x, y, wave, elite) {
+  const def = ENEMY[kind];
+  const hpScale = 1 + (wave - 1) * 0.22 + (elite ? 2.2 : 0);
+  e.active = true;
+  e.kind = kind;
+  e.x = x; e.y = y;
+  e.radius = def.radius * (elite ? 1.35 : 1);
+  e.hp = def.hp * hpScale;
+  e.maxHp = e.hp;
+  e.speed = def.speed * (0.9 + Math.random() * 0.2) * (elite ? 0.9 : 1);
+  e.damage = def.damage * (elite ? 1.5 : 1);
+  e.xp = def.xp * (elite ? 5 : 1);
+  e.score = def.score * (elite ? 5 : 1);
+  e.elite = elite;
+  e.boss = kind === 'warden' || kind === 'hollowStar';
+  e.color = def.color;
+  e.flash = 0;
+  e.slow = 0;
+  e.slowTimer = 0;
+  e.shootTimer = 1 + Math.random() * 1.5;
+  e.touchTimer = 0;
+  e.phase = Math.random() * Math.PI * 2;
+  e.wobble = 0;
+}
+
+/** One step of enemy movement toward the player. Returns nothing; sets e.x/e.y. */
+function moveEnemy(e, player, dt, time) {
+  const dx = player.x - e.x;
+  const dy = player.y - e.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  let speed = e.speed;
+  if (e.slowTimer > 0) speed *= 0.55;
+  if (e.kind === 'spitter') {
+    // Spitters hold a ring around the player instead of charging in.
+    const want = 260;
+    const radial = dist > want + 40 ? 1 : dist < want - 40 ? -1 : 0;
+    const tangent = Math.sin(time * 0.7 + e.phase) > 0 ? 1 : -1;
+    e.x += ((dx / dist) * radial + (-dy / dist) * tangent * 0.6) * speed * dt;
+    e.y += ((dy / dist) * radial + (dx / dist) * tangent * 0.6) * speed * dt;
+  } else if (e.kind === 'skitter') {
+    // Skitters zig-zag as they close in.
+    const wob = Math.sin(time * 5 + e.phase) * 0.6;
+    e.x += ((dx / dist) + (-dy / dist) * wob) * speed * dt;
+    e.y += ((dy / dist) + (dx / dist) * wob) * speed * dt;
+  } else {
+    e.x += (dx / dist) * speed * dt;
+    e.y += (dy / dist) * speed * dt;
+  }
+  // Bosses drift in a slow spiral on top of the chase.
+  if (e.boss) {
+    e.x += Math.cos(time * 0.9 + e.phase) * 22 * dt;
+    e.y += Math.sin(time * 0.9 + e.phase) * 22 * dt;
+  }
+  e.x = Math.max(-60, Math.min(FIELD.width + 60, e.x));
+  e.y = Math.max(-60, Math.min(FIELD.height + 60, e.y));
+}
+
+// ---- player.js ----
+// The player: position, health, movement and the dash. The world owns the
+// rules around the player; this module owns the player's own numbers.
+
+
+function createPlayer() {
+  return {
+    x: FIELD.width / 2,
+    y: FIELD.height / 2,
+    radius: PLAYER.radius,
+    hp: PLAYER.maxHp,
+    maxHp: PLAYER.maxHp,
+    level: 1,
+    xp: 0,
+    xpNext: 6,
+    speedMul: 1,
+    magnetMul: 1,
+    damageMul: 1,
+    rateMul: 1,
+    dashCooldownMul: 1,
+    weapons: [makeWeapon('blaster')],
+    dashTimer: 0,
+    dashCooldown: 0,
+    dashX: 0,
+    dashY: 0,
+    invuln: 0,
+    aimX: 1,
+    aimY: 0,
+    moving: false,
+    hurtFlash: 0,
+  };
+}
+
+function resetPlayer(p) {
+  const fresh = createPlayer();
+  Object.assign(p, fresh);
+  p.weapons = fresh.weapons;
+}
+
+/** Move the player one step. Dash overrides normal movement while it lasts. */
+function movePlayer(p, move, dashPressed, dt) {
+  p.moving = move.x !== 0 || move.y !== 0;
+  if (move.x !== 0 || move.y !== 0) {
+    p.aimX = move.x;
+    p.aimY = move.y;
+  }
+  if (p.dashCooldown > 0) p.dashCooldown -= dt;
+  if (p.invuln > 0) p.invuln -= dt;
+  if (p.hurtFlash > 0) p.hurtFlash -= dt;
+  if (dashPressed && p.dashCooldown <= 0 && p.dashTimer <= 0) {
+    p.dashTimer = PLAYER.dashTime;
+    p.dashCooldown = PLAYER.dashCooldown * p.dashCooldownMul;
+    p.invuln = Math.max(p.invuln, PLAYER.dashInvuln);
+    const len = Math.hypot(move.x, move.y);
+    if (len > 0) { p.dashX = move.x / len; p.dashY = move.y / len; }
+    else { p.dashX = p.aimX; p.dashY = p.aimY; }
+    return true; // dashed
+  }
+  if (p.dashTimer > 0) {
+    p.dashTimer -= dt;
+    p.x += p.dashX * PLAYER.dashSpeed * dt;
+    p.y += p.dashY * PLAYER.dashSpeed * dt;
+  } else {
+    const speed = PLAYER.speed * p.speedMul;
+    p.x += move.x * speed * dt;
+    p.y += move.y * speed * dt;
+  }
+  p.x = Math.max(p.radius, Math.min(FIELD.width - p.radius, p.x));
+  p.y = Math.max(p.radius, Math.min(FIELD.height - p.radius, p.y));
+  return false;
+}
+
+/** Damage the player. Returns 'dead' when HP hits zero, 'hurt' when it lands, 'immune' otherwise. */
+function hurtPlayer(p, damage) {
+  if (p.invuln > 0 || p.dashTimer > 0) return 'immune';
+  p.hp -= damage;
+  p.invuln = 0.6;
+  p.hurtFlash = 0.25;
+  return p.hp <= 0 ? 'dead' : 'hurt';
+}
+
+// ---- world.js ----
+// The game's rules and state, with no drawing and no browser in it: waves,
+// spawning, weapons, collisions, XP and levelling, combo and score, bosses,
+// victory and defeat. step() advances one fixed step and returns what happened
+// as bit flags, so the caller can react without the world knowing about screens
+// or sound. The pools are allocated once, at boot; nothing here allocates in
+// the hot loop except short-lived zap visuals, which are capped.
+
+
+
+
+
+
+
+const EVENT_HIT = 1;
+const EVENT_PICKUP = 2;
+const EVENT_LEVELUP = 4;
+const EVENT_OVER = 8;
+const EVENT_WIN = 16;
+const EVENT_WAVE = 32;
+const EVENT_BOSS = 64;
+const EVENT_KILL = 128;
+
+function dist2(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return dx * dx + dy * dy;
+}
+
+function createWorld(random, audio) {
+  const particles = createParticles();
+  const player = createPlayer();
+
+  const enemies = [];
+  for (let i = 0; i < POOL.enemies; i += 1) {
+    enemies.push({ active: false, kind: 'drifter', x: 0, y: 0, radius: 10, hp: 1, maxHp: 1, speed: 0, damage: 0, xp: 0, score: 0, elite: false, boss: false, color: '#fff', flash: 0, slow: 0, slowTimer: 0, shootTimer: 0, touchTimer: 0, phase: 0, wobble: 0, novaMark: 0 });
+  }
+  const shards = [];
+  for (let i = 0; i < POOL.shards; i += 1) shards.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, value: 1, big: false, bob: 0 });
+  const shots = [];
+  for (let i = 0; i < POOL.shots; i += 1) shots.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, damage: 0, radius: 5, pierce: 0, life: 0, color: '#39f5d6' });
+  const orbs = [];
+  for (let i = 0; i < POOL.orbs; i += 1) orbs.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, damage: 0, radius: 7, life: 0 });
+
+  const state = {
+    player,
+    enemies,
+    shards,
+    shots,
+    orbs,
+    particles,
+    zaps: [],
+    rings: [],
+    wave: 1,
+    waveTime: 0,
+    waveState: 'fight', // fight | intermission
+    intermission: 0,
+    toSpawn: 0,
+    spawnTimer: 0,
+    spawned: 0,
+    bossSpawned: false,
+    boss: null,
+    score: 0,
+    kills: 0,
+    combo: 0,
+    comboTimer: 0,
+    comboMult: 1,
+    elapsed: 0,
+    time: 0,
+    shake: 0,
+    hitStop: 0,
+    over: false,
+    won: false,
+    pendingLevels: 0,
+    choices: null,
+    banner: null, // { text, sub, timer }
+    stats: { damageDealt: 0, levelUps: 0, shardsCollected: 0 },
+    novaId: 0,
+  };
+
+  function setBanner(text, sub, seconds = 2.2) {
+    state.banner = { text, sub, timer: seconds };
+  }
+
+  function freeEnemy() {
+    for (const e of enemies) if (!e.active) return e;
+    return null;
+  }
+  function freeShard() {
+    for (const s of shards) if (!s.active) return s;
+    return null;
+  }
+  function freeShot() {
+    for (const s of shots) if (!s.active) return s;
+    return null;
+  }
+  function freeOrb() {
+    for (const o of orbs) if (!o.active) return o;
+    return null;
+  }
+
+  function dropShards(x, y, value) {
+    let left = value;
+    let guard = 0;
+    while (left > 0 && guard < 6) {
+      const s = freeShard();
+      if (!s) return;
+      const v = left >= 5 ? 5 : left;
+      left -= v;
+      s.active = true;
+      s.x = x + (random() - 0.5) * 24;
+      s.y = y + (random() - 0.5) * 24;
+      s.vx = (random() - 0.5) * 60;
+      s.vy = (random() - 0.5) * 60;
+      s.value = v;
+      s.big = v >= 5;
+      s.bob = random() * Math.PI * 2;
+      guard += 1;
+    }
+  }
+
+  function nearestEnemy(x, y, maxDist) {
+    let best = null;
+    let bestD = maxDist * maxDist;
+    for (const e of enemies) {
+      if (!e.active) continue;
+      const d = dist2(x, y, e.x, e.y);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    return best;
+  }
+
+  function damageEnemy(e, damage, kx = 0, ky = 0) {
+    if (!e.active) return false;
+    e.hp -= damage;
+    e.flash = 0.09;
+    state.stats.damageDealt += damage;
+    particles.damageNumber(e.x, e.y - e.radius, damage, '#fff', e.boss ? 20 : 13);
+    if (kx !== 0 || ky !== 0) {
+      const len = Math.hypot(kx, ky) || 1;
+      e.x += (kx / len) * 6;
+      e.y += (ky / len) * 6;
+    }
+    if (e.hp > 0) return false;
+    e.active = false;
+    state.kills += 1;
+    state.combo += 1;
+    state.comboTimer = COMBO.window;
+    state.comboMult = Math.min(COMBO.maxMult, 1 + state.combo * COMBO.perKill);
+    state.score += Math.round(e.score * state.comboMult);
+    particles.burst(e.x, e.y, e.color, e.boss ? 60 : e.elite ? 26 : 12, e.boss ? 320 : 200);
+    dropShards(e.x, e.y, e.xp);
+    if (e.boss) {
+      state.shake = Math.max(state.shake, 14);
+      state.hitStop = 0.12;
+      particles.ring(e.x, e.y, '#ffffff', 40, 420);
+      audio.kill();
+      if (e.kind === 'hollowStar') {
+        state.won = true;
+        return true;
+      }
+      if (state.waveState === 'fight' && state.wave === 5) {
+        // The wave-5 boss dying ends the wave at once.
+        state.waveTime = WAVE_SECONDS;
+      }
+    } else if (e.elite) {
+      state.shake = Math.max(state.shake, 5);
+      state.hitStop = Math.max(state.hitStop, 0.05);
+      audio.kill();
+    }
+    return true;
+  }
+
+  function fireBlaster(w, stats) {
+    const target = nearestEnemy(player.x, player.y, 620);
+    if (!target) return;
+    const baseAngle = Math.atan2(target.y - player.y, target.x - player.x);
+    for (let i = 0; i < stats.count; i += 1) {
+      const s = freeShot();
+      if (!s) return;
+      const spread = (i - (stats.count - 1) / 2) * 0.16;
+      const a = baseAngle + spread;
+      s.active = true;
+      s.x = player.x + Math.cos(a) * (player.radius + 6);
+      s.y = player.y + Math.sin(a) * (player.radius + 6);
+      s.vx = Math.cos(a) * stats.speed;
+      s.vy = Math.sin(a) * stats.speed;
+      s.damage = stats.damage;
+      s.radius = 5;
+      s.pierce = player.weapons.find((x) => x.id === 'blaster').level >= 5 ? 1 : 0;
+      s.life = 1.1;
+      s.color = WEAPON_DEFS.blaster.color;
+    }
+    audio.shoot();
+  }
+
+  function fireLightning(w, stats) {
+    let fromX = player.x;
+    let fromY = player.y;
+    let remaining = stats.count;
+    let guard = 0;
+    while (remaining > 0 && guard < 8) {
+      guard += 1;
+      const target = nearestEnemy(fromX, fromY, 460);
+      if (!target) break;
+      state.zaps.push({ x1: fromX, y1: fromY, x2: target.x, y2: target.y, life: 0.16, maxLife: 0.16 });
+      if (state.zaps.length > 10) state.zaps.shift();
+      damageEnemy(target, stats.damage);
+      particles.burst(target.x, target.y, WEAPON_DEFS.lightning.color, 6, 140, 2.5);
+      fromX = target.x;
+      fromY = target.y;
+      remaining -= 1;
+    }
+    if (guard > 0) audio.hit();
+  }
+
+  function fireNova(w, stats) {
+    state.novaId += 1;
+    const radius = 200 + w.level * 14;
+    state.rings.push({ x: player.x, y: player.y, radius: 10, maxRadius: radius, life: 0.45, maxLife: 0.45, color: WEAPON_DEFS.nova.color });
+    for (const e of enemies) {
+      if (!e.active) continue;
+      const d = Math.hypot(e.x - player.x, e.y - player.y);
+      if (d <= radius + e.radius) {
+        const kx = e.x - player.x;
+        const ky = e.y - player.y;
+        damageEnemy(e, stats.damage, kx, ky);
+      }
+    }
+    state.shake = Math.max(state.shake, 4);
+    audio.boss();
+  }
+
+  function frostTick(w, stats, dt) {
+    const radius = 120 + w.level * 12;
+    w.tick -= dt;
+    if (w.tick > 0) return;
+    w.tick = 0.5;
+    for (const e of enemies) {
+      if (!e.active) continue;
+      const d = Math.hypot(e.x - player.x, e.y - player.y);
+      if (d <= radius + e.radius) {
+        e.slowTimer = 0.9;
+        damageEnemy(e, stats.damage);
+      }
+    }
+  }
+
+  function bladesStep(w, stats, dt) {
+    w.angle += dt * 3.4;
+    const radius = 62 + w.level * 4;
+    for (let i = 0; i < stats.count; i += 1) {
+      const a = w.angle + (i / stats.count) * Math.PI * 2;
+      const bx = player.x + Math.cos(a) * radius;
+      const by = player.y + Math.sin(a) * radius;
+      if (Math.random() < 0.35) particles.trail(bx, by, WEAPON_DEFS.blades.color);
+      for (const e of enemies) {
+        if (!e.active) continue;
+        const d = Math.hypot(e.x - bx, e.y - by);
+        if (d < e.radius + 13) damageEnemy(e, stats.damage * dt * 6, Math.cos(a), Math.sin(a));
+      }
+    }
+  }
+
+  function updateWeapons(dt) {
+    for (const w of player.weapons) {
+      const stats = weaponStats(w, player.damageMul, player.rateMul);
+      if (w.id === 'blades') { bladesStep(w, stats, dt); continue; }
+      if (w.id === 'frost') { frostTick(w, stats, dt); continue; }
+      w.cooldown -= dt;
+      if (w.cooldown > 0) continue;
+      if (w.id === 'blaster') {
+        w.cooldown = 1 / stats.rate;
+        fireBlaster(w, stats);
+      } else if (w.id === 'lightning') {
+        w.cooldown = 1 / stats.rate;
+        fireLightning(w, stats);
+      } else if (w.id === 'nova') {
+        w.cooldown = 1 / stats.rate;
+        fireNova(w, stats);
+      }
+    }
+  }
+
+  function updateShots(dt) {
+    for (const s of shots) {
+      if (!s.active) continue;
+      s.life -= dt;
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      if (s.life <= 0 || s.x < -20 || s.x > FIELD.width + 20 || s.y < -20 || s.y > FIELD.height + 20) {
+        s.active = false;
+        continue;
+      }
+      for (const e of enemies) {
+        if (!e.active) continue;
+        const rr = e.radius + s.radius;
+        if (dist2(s.x, s.y, e.x, e.y) < rr * rr) {
+          damageEnemy(e, s.damage, s.vx, s.vy);
+          particles.burst(s.x, s.y, s.color, 3, 90, 2);
+          if (s.pierce > 0) { s.pierce -= 1; }
+          else { s.active = false; }
+          break;
+        }
+      }
+    }
+    for (const o of orbs) {
+      if (!o.active) continue;
+      o.life -= dt;
+      o.x += o.vx * dt;
+      o.y += o.vy * dt;
+      if (o.life <= 0 || o.x < -30 || o.x > FIELD.width + 30 || o.y < -30 || o.y > FIELD.height + 30) {
+        o.active = false;
+        continue;
+      }
+      const rr = player.radius + o.radius;
+      if (dist2(o.x, o.y, player.x, player.y) < rr * rr) {
+        o.active = false;
+        if (hurtPlayer(player, o.damage) === 'dead') state.over = true;
+        else if (player.hp > 0) { state.shake = Math.max(state.shake, 6); audio.hurt(); }
+      }
+    }
+  }
+
+  function updateShards(dt) {
+    const magnetR = PLAYER.magnetRadius * player.magnetMul;
+    const pickupR = PLAYER.pickupRadius;
+    for (const s of shards) {
+      if (!s.active) continue;
+      s.bob += dt * 4;
+      const d = Math.hypot(player.x - s.x, player.y - s.y);
+      if (d < magnetR) {
+        const pull = 560 * (1 - d / (magnetR + 1)) + 120;
+        s.vx += ((player.x - s.x) / (d || 1)) * pull * dt * 4;
+        s.vy += ((player.y - s.y) / (d || 1)) * pull * dt * 4;
+      }
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.vx *= 0.9;
+      s.vy *= 0.9;
+      if (d < pickupR + 6) {
+        s.active = false;
+        player.xp += s.value;
+        state.stats.shardsCollected += 1;
+        audio.pickup();
+        particles.burst(s.x, s.y, '#7df9ff', 3, 80, 2);
+        while (player.xp >= player.xpNext) {
+          player.xp -= player.xpNext;
+          player.level += 1;
+          player.xpNext = xpForLevel(player.level);
+          state.pendingLevels += 1;
+          state.stats.levelUps += 1;
+        }
+      }
+    }
+  }
+
+  function updateEnemies(dt) {
+    for (const e of enemies) {
+      if (!e.active) continue;
+      if (e.flash > 0) e.flash -= dt;
+      if (e.slowTimer > 0) e.slowTimer -= dt;
+      if (e.touchTimer > 0) e.touchTimer -= dt;
+      moveEnemy(e, player, dt, state.time);
+      // Spitters shoot.
+      if (e.kind === 'spitter') {
+        e.shootTimer -= dt;
+        if (e.shootTimer <= 0) {
+          e.shootTimer = 2.2 + random() * 1.2;
+          const o = freeOrb();
+          if (o) {
+            const d = Math.hypot(player.x - e.x, player.y - e.y) || 1;
+            o.active = true;
+            o.x = e.x; o.y = e.y;
+            o.vx = ((player.x - e.x) / d) * 170;
+            o.vy = ((player.y - e.y) / d) * 170;
+            o.damage = e.damage;
+            o.life = 4;
+          }
+        }
+      }
+      // Contact damage.
+      const rr = e.radius + player.radius - 2;
+      if (dist2(e.x, e.y, player.x, player.y) < rr * rr && e.touchTimer <= 0) {
+        e.touchTimer = 0.8;
+        const result = hurtPlayer(player, e.damage);
+        if (result === 'dead') { state.over = true; return; }
+        if (result === 'hurt') {
+          state.shake = Math.max(state.shake, 7);
+          state.combo = 0;
+          state.comboMult = 1;
+          audio.hurt();
+          particles.burst(player.x, player.y, '#ff5d73', 14, 220);
+        }
+      }
+    }
+    // Gentle separation so enemies do not stack into one blob.
+    for (let i = 0; i < enemies.length; i += 1) {
+      const a = enemies[i];
+      if (!a.active) continue;
+      for (let j = i + 1; j < enemies.length; j += 1) {
+        const b = enemies[j];
+        if (!b.active) continue;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const rr = a.radius + b.radius;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0.01 && d2 < rr * rr) {
+          const d = Math.sqrt(d2);
+          const push = (rr - d) / 2 / d;
+          a.x -= dx * push * 0.5;
+          a.y -= dy * push * 0.5;
+          b.x += dx * push * 0.5;
+          b.y += dy * push * 0.5;
+        }
+      }
+    }
+  }
+
+  function startWave(wave) {
+    state.wave = wave;
+    state.waveTime = 0;
+    state.waveState = 'fight';
+    state.bossSpawned = false;
+    state.boss = null;
+    const plan = wavePlan(wave);
+    state.toSpawn = plan.count;
+    state.spawned = 0;
+    state.spawnTimer = 0.5;
+    if (wave === 5) setBanner('WAVE 5 — THE WARDEN COMES', 'Something huge is stirring in the dark.', 2.6);
+    else if (wave === FINAL_WAVE) setBanner('FINAL WAVE — THE HOLLOW STAR', 'Defeat it and the arena is yours.', 2.6);
+    else setBanner(`WAVE ${wave}`, wave >= 8 ? 'They are getting faster.' : 'Survive.', 1.8);
+  }
+
+  function spawnBoss(kind) {
+    const e = freeEnemy();
+    if (!e) return;
+    const pos = spawnEdge(random);
+    initEnemy(e, kind, pos.x, pos.y, state.wave, false);
+    e.hp *= 1;
+    state.boss = e;
+    state.bossSpawned = true;
+    audio.boss();
+    setBanner(kind === 'hollowStar' ? 'THE HOLLOW STAR' : 'THE WARDEN', 'Its health bar is at the top. Do not stand still.', 2.6);
+  }
+
+  function reset() {
+    resetPlayer(player);
+    for (const e of enemies) e.active = false;
+    for (const s of shards) s.active = false;
+    for (const s of shots) s.active = false;
+    for (const o of orbs) o.active = false;
+    particles.clear();
+    state.zaps = [];
+    state.rings = [];
+    state.wave = 1;
+    state.waveTime = 0;
+    state.waveState = 'fight';
+    state.intermission = 0;
+    state.score = 0;
+    state.kills = 0;
+    state.combo = 0;
+    state.comboTimer = 0;
+    state.comboMult = 1;
+    state.elapsed = 0;
+    state.time = 0;
+    state.shake = 0;
+    state.hitStop = 0;
+    state.over = false;
+    state.won = false;
+    state.pendingLevels = 0;
+    state.choices = null;
+    state.banner = null;
+    state.stats = { damageDealt: 0, levelUps: 0, shardsCollected: 0 };
+    startWave(1);
+  }
+
+  function step(dt, move, dashPressed, harmless) {
+    let events = 0;
+    if (state.hitStop > 0) {
+      state.hitStop -= dt;
+      return events;
+    }
+    state.time += dt;
+    state.elapsed += dt;
+    if (state.banner) {
+      state.banner.timer -= dt;
+      if (state.banner.timer <= 0) state.banner = null;
+    }
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - dt * 26);
+    if (state.comboTimer > 0) {
+      state.comboTimer -= dt;
+      if (state.comboTimer <= 0) { state.combo = 0; state.comboMult = 1; }
+    }
+    for (const z of state.zaps) z.life -= dt;
+    state.zaps = state.zaps.filter((z) => z.life > 0);
+    for (const r of state.rings) {
+      r.life -= dt;
+      r.radius += (r.maxRadius - r.radius) * dt * 9;
+    }
+    state.rings = state.rings.filter((r) => r.life > 0);
+
+    const dashed = movePlayer(player, move, dashPressed, dt);
+    if (dashed) {
+      audio.dash();
+      particles.burst(player.x, player.y, '#39f5d6', 8, 120, 2.5);
+    }
+
+    if (harmless) {
+      // Title-screen attract mode: the world plays itself, nothing can hurt the player.
+      updateWeapons(dt);
+      updateShots(dt);
+      updateEnemiesAttract(dt);
+      particles.step(dt);
+      return events;
+    }
+
+    // Wave flow.
+    if (state.waveState === 'fight') {
+      state.waveTime += dt;
+      const plan = wavePlan(state.wave);
+      const bossWave = state.wave === 5 || state.wave === FINAL_WAVE;
+      if (bossWave && !state.bossSpawned && state.waveTime >= 8) {
+        spawnBoss(state.wave === FINAL_WAVE ? 'hollowStar' : 'warden');
+        events |= EVENT_BOSS;
+      }
+      if (state.toSpawn > 0) {
+        state.spawnTimer -= dt;
+        if (state.spawnTimer <= 0) {
+          state.spawnTimer = plan.interval * (0.7 + random() * 0.6);
+          const batch = state.wave >= 6 ? 2 : 1;
+          for (let b = 0; b < batch && state.toSpawn > 0; b += 1) {
+            const e = freeEnemy();
+            if (!e) break;
+            const pos = spawnEdge(random);
+            state.spawned += 1;
+            state.toSpawn -= 1;
+            const elite = plan.eliteEvery > 0 && state.spawned % plan.eliteEvery === 0;
+            initEnemy(e, pickKind(random, state.wave), pos.x, pos.y, state.wave, elite);
+            if (elite) particles.burst(pos.x, pos.y, '#ffd166', 10, 160);
+          }
+        }
+      }
+      const bossDead = bossWave && state.bossSpawned && (!state.boss || !state.boss.active);
+      const timeUp = state.waveTime >= WAVE_SECONDS;
+      if ((bossWave && bossDead) || (!bossWave && timeUp)) {
+        if (state.wave >= FINAL_WAVE) {
+          // Reached only via the boss dying; handled by state.won above.
+        } else {
+          state.waveState = 'intermission';
+          state.intermission = INTERMISSION_SECONDS;
+          state.score += 50 * state.wave;
+          events |= EVENT_WAVE;
+          setBanner(`WAVE ${state.wave} CLEARED`, `+${50 * state.wave} bonus. Catch your breath.`, 2);
+        }
+      }
+    } else {
+      state.intermission -= dt;
+      if (state.intermission <= 0) {
+        startWave(state.wave + 1);
+        events |= EVENT_WAVE;
+      }
+    }
+
+    updateWeapons(dt);
+    updateShots(dt);
+    updateEnemies(dt);
+    updateShards(dt);
+    particles.step(dt);
+
+    if (state.won) {
+      events |= EVENT_WIN;
+      return events;
+    }
+    if (state.over) {
+      events |= EVENT_OVER;
+      return events;
+    }
+    if (state.pendingLevels > 0 && !state.choices) {
+      state.choices = rollChoices(random, player.weapons);
+      events |= EVENT_LEVELUP;
+    }
+    return events;
+  }
+
+  /** Attract mode: enemies drift and the demo player kites them, no damage, no score. */
+  function updateEnemiesAttract(dt) {
+    if (state.toSpawn > 0) {
+      state.spawnTimer -= dt;
+      if (state.spawnTimer <= 0) {
+        state.spawnTimer = 0.9;
+        const e = freeEnemy();
+        if (e) {
+          const pos = spawnEdge(random);
+          state.toSpawn -= 1;
+          initEnemy(e, pickKind(random, 2), pos.x, pos.y, 2, false);
+        }
+      }
+    }
+    // Demo pilot: drift in a slow circle so the title backdrop stays alive.
+    const cx = FIELD.width / 2;
+    const cy = FIELD.height / 2;
+    const a = state.time * 0.25;
+    player.x = cx + Math.cos(a) * 220;
+    player.y = cy + Math.sin(a * 1.3) * 150;
+    for (const e of enemies) {
+      if (!e.active) continue;
+      moveEnemy(e, player, dt, state.time);
+      const rr = e.radius + player.radius;
+      if (dist2(e.x, e.y, player.x, player.y) < rr * rr) {
+        e.active = false;
+        particles.burst(e.x, e.y, e.color, 8, 160);
+      }
+    }
+    updateShards(dt);
+  }
+
+  /** Apply a level-up choice. Returns fresh choices if another level is queued, else null. */
+  function applyLevelChoice(choice) {
+    const label = applyChoice(player, choice);
+    state.pendingLevels -= 1;
+    state.choices = null;
+    audio.levelUp();
+    particles.ring(player.x, player.y, '#ffd166', 30, 300);
+    if (state.pendingLevels > 0) {
+      state.choices = rollChoices(random, player.weapons);
+      return { label, choices: state.choices };
+    }
+    return { label, choices: null };
+  }
+
+  /** Testing hook: a strong level-8 loadout dropped at wave 9. Never used in normal play. */
+  function debugBoost() {
+    player.level = 8;
+    player.xp = 0;
+    player.xpNext = xpForLevel(8);
+    player.maxHp = 220;
+    player.hp = 220;
+    player.damageMul = 1.6;
+    player.rateMul = 1.4;
+    player.magnetMul = 1.5;
+    player.weapons = [makeWeapon('blaster'), makeWeapon('blades'), makeWeapon('lightning'), makeWeapon('nova'), makeWeapon('frost')];
+    player.weapons[0].level = 4;
+    player.weapons[1].level = 3;
+    player.weapons[2].level = 3;
+    player.weapons[3].level = 2;
+    player.weapons[4].level = 2;
+    for (const e of enemies) e.active = false;
+    for (const s of shards) s.active = false;
+    startWave(9);
+  }
+
+  /** Testing hook: spawn the wave-10 boss at low HP. Never used in normal play. */
+  function debugSpawnBoss() {
+    spawnBoss('hollowStar');
+    if (state.boss) state.boss.hp = 60;
+  }
+
+  reset();
+  return { state, reset, step, applyLevelChoice, debugBoost, debugSpawnBoss, startWave };
+}
+
+// ---- ui.js ----
+// Overlay screens: their layout in logical 1280x720 coordinates and the buttons
+// they offer. Pure geometry and copy — no drawing here, so the main loop can
+// hit-test a click against the same rects the renderer paints.
+
+const SCREEN_TITLE = 'title';
+const SCREEN_HOWTO = 'howto';
+const SCREEN_PLAY = 'play';
+const SCREEN_PAUSED = 'paused';
+const SCREEN_LEVELUP = 'levelup';
+const SCREEN_OVER = 'over';
+const SCREEN_WIN = 'win';
+
+const W = FIELD.width;
+const H = FIELD.height;
+
+function centreRect(w, h, y) {
+  return { x: (W - w) / 2, y, w, h };
+}
+
+function titleLayout() {
+  return {
+    panel: centreRect(680, 470, 105),
+    buttons: [
+      { id: 'start', label: '▶  START RUN', ...centreRect(300, 56, 452) },
+      { id: 'howto', label: 'HOW TO PLAY', ...centreRect(300, 56, 520) },
+    ],
+    mute: { id: 'mute', label: '♪', x: W - 76, y: H - 100, w: 56, h: 40 },
+  };
+}
+
+function howtoLayout() {
+  return {
+    panel: centreRect(760, 520, 90),
+    buttons: [
+      { id: 'back', label: '←  BACK', ...centreRect(260, 52, 520) },
+    ],
+  };
+}
+
+function pauseLayout() {
+  return {
+    panel: centreRect(520, 350, 170),
+    buttons: [
+      { id: 'resume', label: 'RESUME  (P)', ...centreRect(280, 52, 330) },
+      { id: 'restart', label: 'RESTART  (R)', ...centreRect(280, 52, 396) },
+      { id: 'quit', label: 'QUIT TO TITLE', ...centreRect(280, 52, 462) },
+    ],
+  };
+}
+
+function levelUpLayout(choices) {
+  const cards = [];
+  const cardW = 300;
+  const cardH = 250;
+  const gap = 24;
+  const total = choices.length * cardW + (choices.length - 1) * gap;
+  let x = (W - total) / 2;
+  const y = 235;
+  choices.forEach((choice, i) => {
+    cards.push({ choice, index: i, rect: { x, y, w: cardW, h: cardH } });
+    x += cardW + gap;
+  });
+  return { cards };
+}
+
+function overLayout() {
+  return {
+    panel: centreRect(620, 470, 130),
+    buttons: [
+      { id: 'again', label: '↻  RUN IT BACK  (R)', ...centreRect(320, 56, 478) },
+      { id: 'title', label: 'TITLE SCREEN', ...centreRect(320, 52, 546) },
+    ],
+  };
+}
+
+function winLayout() {
+  return {
+    panel: centreRect(680, 500, 115),
+    buttons: [
+      { id: 'again', label: '↻  PLAY AGAIN  (R)', ...centreRect(320, 56, 488) },
+      { id: 'title', label: 'TITLE SCREEN', ...centreRect(320, 52, 556) },
+    ],
+  };
+}
+
+/** True when the logical point is inside the rect. */
+function hit(rect, x, y) {
+  return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+}
+
+// ---- render.js ----
+// Drawing only: the world's state and the current screen in, pixels out. The
+// 1280x720 playfield is scaled to fit the window and centred, the margin filled
+// with the backdrop colour. Neon glow is faked with layered strokes and the
+// 'lighter' composite — no images, no fonts to load, nothing from the network.
+
+function createRenderer(canvas) {
+  const context = canvas.getContext('2d');
+  const view = { scale: 1, x: 0, y: 0, cssScale: 1 };
+  const fonts = new Map();
+
+  function resize() {
+    const ratio = window.devicePixelRatio || 1;
+    const width = Math.round(window.innerWidth * ratio);
+    const height = Math.round(window.innerHeight * ratio);
+    canvas.width = width;
+    canvas.height = height;
+    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
+    view.x = (width - FIELD.width * view.scale) / 2;
+    view.y = (height - FIELD.height * view.scale) / 2;
+    view.cssScale = width / window.innerWidth;
+  }
+
+  function font(size, bold = false) {
+    const key = `${bold ? 'b' : ''}${size}`;
+    if (!fonts.has(key)) fonts.set(key, `${bold ? '700 ' : ''}${size}px ${FONT}`);
+    return fonts.get(key);
+  }
+
+  function text(value, x, y, size, color, align = 'left', bold = false) {
+    context.font = font(size, bold);
+    context.fillStyle = color;
+    context.textAlign = align;
+    context.textBaseline = 'alphabetic';
+    context.fillText(value, x, y);
+  }
+
+  function glowCircle(x, y, r, color, alpha = 0.35) {
+    context.globalAlpha = alpha;
+    context.fillStyle = color;
+    context.beginPath();
+    context.arc(x, y, r * 1.9, 0, Math.PI * 2);
+    context.fill();
+    context.globalAlpha = 1;
+  }
+
+  function poly(x, y, radius, sides, rotation) {
+    context.beginPath();
+    for (let i = 0; i < sides; i += 1) {
+      const a = rotation + (i / sides) * Math.PI * 2;
+      const px = x + Math.cos(a) * radius;
+      const py = y + Math.sin(a) * radius;
+      if (i === 0) context.moveTo(px, py);
+      else context.lineTo(px, py);
+    }
+    context.closePath();
+  }
+
+  function star(x, y, radius, rotation) {
+    context.beginPath();
+    for (let i = 0; i < 10; i += 1) {
+      const r = i % 2 === 0 ? radius : radius * 0.45;
+      const a = rotation + (i / 10) * Math.PI * 2;
+      const px = x + Math.cos(a) * r;
+      const py = y + Math.sin(a) * r;
+      if (i === 0) context.moveTo(px, py);
+      else context.lineTo(px, py);
+    }
+    context.closePath();
+  }
+
+  function drawField(state) {
+    context.fillStyle = PALETTE.arena;
+    context.fillRect(0, 0, FIELD.width, FIELD.height);
+    // Grid.
+    context.strokeStyle = PALETTE.grid;
+    context.lineWidth = 1;
+    context.beginPath();
+    for (let x = 0; x <= FIELD.width; x += 64) { context.moveTo(x, 0); context.lineTo(x, FIELD.height); }
+    for (let y = 0; y <= FIELD.height; y += 64) { context.moveTo(0, y); context.lineTo(FIELD.width, y); }
+    context.stroke();
+    // Arena edge glow.
+    context.strokeStyle = PALETTE.arenaEdge;
+    context.lineWidth = 3;
+    context.strokeRect(1.5, 1.5, FIELD.width - 3, FIELD.height - 3);
+    context.strokeStyle = 'rgba(57,245,214,0.25)';
+    context.lineWidth = 1;
+    context.strokeRect(6, 6, FIELD.width - 12, FIELD.height - 12);
+  }
+
+  function drawShards(state) {
+    for (const s of state.shards) {
+      if (!s.active) continue;
+      const bob = Math.sin(s.bob) * 2;
+      const color = s.big ? PALETTE.shardBig : PALETTE.shard;
+      context.save();
+      context.translate(s.x, s.y + bob);
+      context.rotate(Math.PI / 4);
+      context.fillStyle = color;
+      const r = s.big ? 7 : 5;
+      context.fillRect(-r, -r, r * 2, r * 2);
+      context.restore();
+    }
+  }
+
+  function drawOrbs(state) {
+    for (const o of state.orbs) {
+      if (!o.active) continue;
+      glowCircle(o.x, o.y, o.radius, '#c77dff', 0.5);
+      context.fillStyle = '#e9d5ff';
+      context.beginPath();
+      context.arc(o.x, o.y, o.radius, 0, Math.PI * 2);
+      context.fill();
+    }
+  }
+
+  function drawShots(state) {
+    context.save();
+    context.globalCompositeOperation = 'lighter';
+    for (const s of state.shots) {
+      if (!s.active) continue;
+      glowCircle(s.x, s.y, s.radius + 2, s.color, 0.55);
+      context.fillStyle = '#ffffff';
+      context.beginPath();
+      context.arc(s.x, s.y, s.radius * 0.7, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+  }
+
+  function drawEnemy(e, time) {
+    const flash = e.flash > 0;
+    const color = flash ? '#ffffff' : e.color;
+    const angleToPlayer = Math.atan2(stateRef.player.y - e.y, stateRef.player.x - e.x);
+    context.save();
+    context.translate(e.x, e.y);
+    if (e.elite) {
+      context.strokeStyle = '#ffd166';
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(0, 0, e.radius + 6 + Math.sin(time * 6) * 2, 0, Math.PI * 2);
+      context.stroke();
+    }
+    glowCircle(0, 0, e.radius, e.color, e.boss ? 0.5 : 0.28);
+    context.fillStyle = color;
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    if (e.kind === 'drifter') {
+      context.rotate(Math.PI / 4);
+      context.fillRect(-e.radius * 0.8, -e.radius * 0.8, e.radius * 1.6, e.radius * 1.6);
+    } else if (e.kind === 'skitter') {
+      poly(0, 0, e.radius, 3, angleToPlayer);
+      context.fill();
+    } else if (e.kind === 'spitter') {
+      poly(0, 0, e.radius, 6, time * 0.8);
+      context.fill();
+      context.fillStyle = '#0a0f22';
+      context.beginPath();
+      context.arc(0, 0, e.radius * 0.4, 0, Math.PI * 2);
+      context.fill();
+    } else if (e.kind === 'brute') {
+      context.fillRect(-e.radius, -e.radius, e.radius * 2, e.radius * 2);
+      context.strokeRect(-e.radius * 0.55, -e.radius * 0.55, e.radius * 1.1, e.radius * 1.1);
+    } else if (e.kind === 'warden') {
+      poly(0, 0, e.radius, 5, time * 0.5);
+      context.fill();
+      context.fillStyle = '#0a0f22';
+      poly(0, 0, e.radius * 0.45, 5, -time * 0.5);
+      context.fill();
+    } else {
+      // hollowStar: a five-pointed star, slowly turning.
+      star(0, 0, e.radius, time * 0.4);
+      context.fill();
+    }
+    context.restore();
+    // Boss / elite health bar.
+    if ((e.boss || e.elite) && e.hp < e.maxHp) {
+      const w = e.boss ? 90 : 44;
+      const y = e.y - e.radius - 12;
+      context.fillStyle = 'rgba(0,0,0,0.55)';
+      context.fillRect(e.x - w / 2, y, w, 6);
+      context.fillStyle = e.boss ? PALETTE.boss : '#ffd166';
+      context.fillRect(e.x - w / 2, y, w * Math.max(0, e.hp / e.maxHp), 6);
+    }
+  }
+
+  let stateRef = null;
+
+  function drawPlayer(state, time) {
+    const p = state.player;
+    if (p.invuln > 0 && p.dashTimer <= 0 && Math.floor(p.invuln * 12) % 2 === 0) return; // blink
+    const angle = Math.atan2(p.aimY, p.aimX);
+    context.save();
+    context.translate(p.x, p.y);
+    glowCircle(0, 0, p.radius + 8, PALETTE.player, 0.5);
+    context.rotate(angle);
+    context.fillStyle = PALETTE.player;
+    poly(0, 0, p.radius + 4, 3, 0);
+    context.fill();
+    context.fillStyle = PALETTE.playerCore;
+    context.beginPath();
+    context.arc(0, 0, 5.5, 0, Math.PI * 2);
+    context.fill();
+    context.restore();
+    if (p.hurtFlash > 0) {
+      context.strokeStyle = `rgba(255,93,115,${p.hurtFlash * 2})`;
+      context.lineWidth = 3;
+      context.beginPath();
+      context.arc(p.x, p.y, p.radius + 10, 0, Math.PI * 2);
+      context.stroke();
+    }
+  }
+
+  function drawBlades(state) {
+    const p = state.player;
+    const blades = p.weapons.find((w) => w.id === 'blades');
+    if (!blades) return;
+    const count = 1 + blades.level;
+    const radius = 62 + blades.level * 4;
+    context.save();
+    context.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < count; i += 1) {
+      const a = blades.angle + (i / count) * Math.PI * 2;
+      const bx = p.x + Math.cos(a) * radius;
+      const by = p.y + Math.sin(a) * radius;
+      glowCircle(bx, by, 10, WEAPON_DEFS.blades.color, 0.5);
+      context.fillStyle = '#fff3c4';
+      context.beginPath();
+      context.arc(bx, by, 5, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+  }
+
+  function drawParticles(state) {
+    context.save();
+    context.globalCompositeOperation = 'lighter';
+    for (const pt of state.particles.list) {
+      if (!pt.active) continue;
+      context.globalAlpha = Math.max(0, pt.life / pt.maxLife);
+      context.fillStyle = pt.color;
+      context.beginPath();
+      context.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2);
+      context.fill();
+    }
+    context.restore();
+    context.globalAlpha = 1;
+    for (const n of state.particles.numbers) {
+      if (!n.active) continue;
+      context.globalAlpha = Math.max(0, n.life / n.maxLife);
+      text(n.text, n.x, n.y, n.size, n.color, 'center', true);
+    }
+    context.globalAlpha = 1;
+  }
+
+  function drawZapsAndRings(state) {
+    context.save();
+    context.globalCompositeOperation = 'lighter';
+    for (const z of state.zaps) {
+      context.globalAlpha = Math.max(0, z.life / z.maxLife);
+      context.strokeStyle = '#aefcff';
+      context.lineWidth = 2.5;
+      context.beginPath();
+      const mx = (z.x1 + z.x2) / 2 + (Math.random() - 0.5) * 30;
+      const my = (z.y1 + z.y2) / 2 + (Math.random() - 0.5) * 30;
+      context.moveTo(z.x1, z.y1);
+      context.lineTo(mx, my);
+      context.lineTo(z.x2, z.y2);
+      context.stroke();
+    }
+    for (const r of state.rings) {
+      context.globalAlpha = Math.max(0, r.life / r.maxLife);
+      context.strokeStyle = r.color;
+      context.lineWidth = 5;
+      context.beginPath();
+      context.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
+      context.stroke();
+    }
+    context.restore();
+    context.globalAlpha = 1;
+  }
+
+  function bar(x, y, w, h, frac, fill, back = 'rgba(0,0,0,0.55)') {
+    context.fillStyle = back;
+    context.fillRect(x, y, w, h);
+    context.fillStyle = fill;
+    context.fillRect(x, y, w * Math.max(0, Math.min(1, frac)), h);
+  }
+
+  function drawHud(state, best, muted) {
+    const p = state.player;
+    // XP bar across the very top.
+    bar(0, 0, FIELD.width, 7, p.xp / p.xpNext, '#7df9ff', '#101736');
+    // HP.
+    text('HP', 22, 44, 17, PALETTE.muted, 'left', true);
+    bar(56, 30, 230, 18, p.hp / p.maxHp, p.hp / p.maxHp > 0.3 ? '#5dffa0' : '#ff5d73');
+    context.strokeStyle = 'rgba(255,255,255,0.25)';
+    context.lineWidth = 1;
+    context.strokeRect(56, 30, 230, 18);
+    text(`${Math.max(0, Math.ceil(p.hp))} / ${p.maxHp}`, 296, 44, 15, PALETTE.text, 'left');
+    text(`LV ${p.level}`, 22, 72, 17, PALETTE.gold, 'left', true);
+    // Wave + timer, centred.
+    const waveLabel = state.waveState === 'intermission'
+      ? `WAVE ${state.wave} CLEARED — NEXT IN ${Math.ceil(state.intermission)}`
+      : `WAVE ${state.wave} / ${FINAL_WAVE}`;
+    text(waveLabel, FIELD.width / 2, 44, 20, PALETTE.text, 'center', true);
+    if (state.waveState === 'fight') {
+      const left = Math.max(0, 42 - state.waveTime);
+      text(`0:${String(Math.floor(left)).padStart(2, '0')}`, FIELD.width / 2, 68, 15, PALETTE.muted, 'center');
+    }
+    // Boss bar.
+    if (state.boss && state.boss.active) {
+      const name = state.boss.kind === 'hollowStar' ? 'THE HOLLOW STAR' : 'THE WARDEN';
+      text(name, FIELD.width / 2, 100, 16, PALETTE.boss, 'center', true);
+      bar(FIELD.width / 2 - 260, 108, 520, 12, state.boss.hp / state.boss.maxHp, PALETTE.boss);
+    }
+    // Score + combo, right.
+    text(`SCORE ${state.score}`, FIELD.width - 22, 44, 20, PALETTE.text, 'right', true);
+    text(`BEST ${best}`, FIELD.width - 22, 68, 15, PALETTE.muted, 'right');
+    if (state.combo >= 5) {
+      text(`COMBO x${state.comboMult.toFixed(2)}  (${state.combo})`, FIELD.width - 22, 94, 17, '#ffd166', 'right', true);
+    }
+    // Weapons, bottom left.
+    let wx = 22;
+    text('ARSENAL', wx, FIELD.height - 52, 13, PALETTE.muted, 'left', true);
+    for (const w of p.weapons) {
+      const def = WEAPON_DEFS[w.id];
+      text(`${def.icon} ${def.name} ${'●'.repeat(w.level)}${'○'.repeat(5 - w.level)}`, wx, FIELD.height - 28, 15, def.color, 'left');
+      wx += 230;
+    }
+    // Dash cooldown, bottom right.
+    const dashFrac = p.dashCooldown <= 0 ? 1 : 1 - p.dashCooldown / (2.2 * p.dashCooldownMul);
+    text(p.dashCooldown <= 0 ? 'DASH READY  [SPACE]' : 'DASH…', FIELD.width - 22, FIELD.height - 28, 15, dashFrac >= 1 ? '#39f5d6' : PALETTE.muted, 'right', true);
+    bar(FIELD.width - 172, FIELD.height - 20, 150, 6, dashFrac, '#39f5d6');
+    if (muted) text('MUTED  [M]', FIELD.width - 22, FIELD.height - 52, 13, PALETTE.muted, 'right');
+    // Boss off-screen indicator.
+    if (state.boss && state.boss.active) {
+      const b = state.boss;
+      if (b.x < 0 || b.x > FIELD.width || b.y < 0 || b.y > FIELD.height) {
+        const cx = Math.max(30, Math.min(FIELD.width - 30, b.x));
+        const cy = Math.max(90, Math.min(FIELD.height - 30, b.y));
+        const a = Math.atan2(b.y - cy, b.x - cx);
+        context.save();
+        context.translate(cx, cy);
+        context.rotate(a);
+        context.fillStyle = PALETTE.boss;
+        poly(0, 0, 14, 3, 0);
+        context.fill();
+        context.restore();
+      }
+    }
+    // Banner.
+    if (state.banner) {
+      const alpha = Math.min(1, state.banner.timer);
+      context.globalAlpha = alpha;
+      text(state.banner.text, FIELD.width / 2, 190, 34, '#ffffff', 'center', true);
+      if (state.banner.sub) text(state.banner.sub, FIELD.width / 2, 220, 17, PALETTE.muted, 'center');
+      context.globalAlpha = 1;
+    }
+  }
+
+  function panel(rect, title, titleColor = PALETTE.text) {
+    context.fillStyle = 'rgba(5,8,18,0.72)';
+    context.fillRect(0, 0, FIELD.width, FIELD.height);
+    context.fillStyle = PALETTE.panel;
+    context.fillRect(rect.x, rect.y, rect.w, rect.h);
+    context.strokeStyle = PALETTE.panelEdge;
+    context.lineWidth = 2;
+    context.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    text(title, FIELD.width / 2, rect.y + 62, 40, titleColor, 'center', true);
+  }
+
+  function button(rect, label, hovered) {
+    context.fillStyle = hovered ? '#2b3f7a' : '#1a2342';
+    context.fillRect(rect.x, rect.y, rect.w, rect.h);
+    context.strokeStyle = hovered ? '#39f5d6' : PALETTE.panelEdge;
+    context.lineWidth = 2;
+    context.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    text(label, rect.x + rect.w / 2, rect.y + rect.h / 2 + 7, 19, hovered ? '#ffffff' : PALETTE.text, 'center', true);
+  }
+
+  function drawTitle(state, best, bestWave, hover) {
+    const layout = titleLayout();
+    panel(layout.panel, 'LUMENFALL', '#39f5d6');
+    text('N E O N   S U R V I V O R', FIELD.width / 2, layout.panel.y + 100, 18, PALETTE.gold, 'center', true);
+    text('The dark is full of teeth. Your light is loaded.', FIELD.width / 2, layout.panel.y + 138, 17, PALETTE.muted, 'center');
+    text('Survive 10 waves. Slay the Hollow Star.', FIELD.width / 2, layout.panel.y + 166, 17, PALETTE.text, 'center');
+    if (best > 0) text(`BEST  SCORE ${best}  ·  WAVE ${bestWave}`, FIELD.width / 2, layout.panel.y + 200, 16, PALETTE.gold, 'center', true);
+    text('WASD / Arrows — move      SPACE — dash      P — pause      M — mute', FIELD.width / 2, layout.panel.y + 238, 15, PALETTE.muted, 'center');
+    text('Weapons fire on their own. Grab shards, level up, pick your build.', FIELD.width / 2, layout.panel.y + 262, 15, PALETTE.muted, 'center');
+    for (const b of layout.buttons) button(b, b.label, hover && hit(b, hover.x, hover.y));
+    button(layout.mute, '♪', hover && hit(layout.mute, hover.x, hover.y));
+    // Below the panel, clear of both buttons: the footer used to sit inside
+    // the HOW TO PLAY button's rect.
+    text('v1.0 — an original game. No downloads, no accounts, no ads.', FIELD.width / 2, layout.panel.y + layout.panel.h + 26, 13, PALETTE.muted, 'center');
+  }
+
+  function drawHowto(hover) {
+    const layout = howtoLayout();
+    panel(layout.panel, 'HOW TO PLAY');
+    const lines = [
+      ['MOVE', 'WASD or Arrow keys'],
+      ['DASH', 'SPACE — a burst of speed with brief invulnerability'],
+      ['PAUSE', 'P or Esc'],
+      ['MUTE', 'M'],
+      ['GOAL', 'Survive each 42-second wave. Waves 5 and 10 bring bosses.'],
+      ['LEVEL UP', 'Collect glowing shards. Pick 1 of 3 cards with mouse or keys 1-3.'],
+      ['WEAPONS', 'Pulse Blaster · Orbit Blades · Nova Burst · Chain Lightning · Frost Field'],
+      ['ENEMIES', 'Drifters chase · Skitters zig-zag · Spitters shoot · Brutes hit hard'],
+      ['ELITES', 'Gold-ringed foes drop 5x shards. Bosses drop a flood of them.'],
+      ['WIN', 'Defeat the Hollow Star on wave 10.'],
+    ];
+    let y = layout.panel.y + 108;
+    for (const [k, v] of lines) {
+      text(k, layout.panel.x + 40, y, 16, PALETTE.gold, 'left', true);
+      text(v, layout.panel.x + 170, y, 16, PALETTE.text, 'left');
+      y += 34;
+    }
+    for (const b of layout.buttons) button(b, b.label, hover && hit(b, hover.x, hover.y));
+  }
+
+  function drawPaused(hover) {
+    const layout = pauseLayout();
+    panel(layout.panel, 'PAUSED');
+    text('The swarm waits. Breathe.', FIELD.width / 2, layout.panel.y + 108, 17, PALETTE.muted, 'center');
+    for (const b of layout.buttons) button(b, b.label, hover && hit(b, hover.x, hover.y));
+  }
+
+  function drawLevelUp(state, hover) {
+    const layout = levelUpLayout(state.choices);
+    context.fillStyle = 'rgba(5,8,18,0.66)';
+    context.fillRect(0, 0, FIELD.width, FIELD.height);
+    text('LEVEL UP!', FIELD.width / 2, 150, 44, PALETTE.gold, 'center', true);
+    text(`You reached level ${state.player.level}. Choose one.`, FIELD.width / 2, 190, 18, PALETTE.text, 'center');
+    for (const card of layout.cards) {
+      const r = card.rect;
+      const hov = hover && hit(r, hover.x, hover.y);
+      context.fillStyle = hov ? '#18224a' : PALETTE.panel;
+      context.fillRect(r.x, r.y, r.w, r.h);
+      context.strokeStyle = hov ? card.choice.color : PALETTE.panelEdge;
+      context.lineWidth = hov ? 3 : 2;
+      context.strokeRect(r.x, r.y, r.w, r.h);
+      text(card.choice.icon, r.x + r.w / 2, r.y + 74, 44, card.choice.color, 'center');
+      text(card.choice.name, r.x + r.w / 2, r.y + 118, 19, PALETTE.text, 'center', true);
+      // Wrap the blurb to two lines.
+      const words = card.choice.blurb.split(' ');
+      let line = '';
+      let lineY = r.y + 152;
+      const lines = [];
+      for (const word of words) {
+        if ((line + ' ' + word).trim().length > 30) { lines.push(line.trim()); line = word; }
+        else line = `${line} ${word}`;
+      }
+      lines.push(line.trim());
+      for (const ln of lines.slice(0, 3)) { text(ln, r.x + r.w / 2, lineY, 15, PALETTE.muted, 'center'); lineY += 22; }
+      text(`Press ${card.index + 1}`, r.x + r.w / 2, r.y + r.h - 20, 14, card.choice.color, 'center', true);
+    }
+  }
+
+  function statLines(state, best) {
+    return [
+      `Score  ${state.score}`,
+      `Best  ${Math.max(best, state.score)}`,
+      `Wave reached  ${state.wave} / ${FINAL_WAVE}`,
+      `Kills  ${state.kills}`,
+      `Level  ${state.player.level}`,
+      `Time survived  ${Math.floor(state.elapsed / 60)}:${String(Math.floor(state.elapsed % 60)).padStart(2, '0')}`,
+      `Damage dealt  ${Math.round(state.stats.damageDealt)}`,
+    ];
+  }
+
+  function drawOver(state, best, hover) {
+    const layout = overLayout();
+    panel(layout.panel, 'THE LIGHT FADES', '#ff5d73');
+    text(`The swarm takes wave ${state.wave}.`, FIELD.width / 2, layout.panel.y + 100, 17, PALETTE.muted, 'center');
+    let y = layout.panel.y + 148;
+    for (const line of statLines(state, best)) {
+      text(line, FIELD.width / 2, y, 17, PALETTE.text, 'center');
+      y += 30;
+    }
+    for (const b of layout.buttons) button(b, b.label, hover && hit(b, hover.x, hover.y));
+  }
+
+  function drawWin(state, best, hover) {
+    const layout = winLayout();
+    panel(layout.panel, 'THE HOLLOW STAR FALLS', PALETTE.boss);
+    text('All ten waves survived. The arena is yours, Lumin.', FIELD.width / 2, layout.panel.y + 100, 17, PALETTE.muted, 'center');
+    let y = layout.panel.y + 148;
+    for (const line of statLines(state, best)) {
+      text(line, FIELD.width / 2, y, 17, PALETTE.text, 'center');
+      y += 30;
+    }
+    for (const b of layout.buttons) button(b, b.label, hover && hit(b, hover.x, hover.y));
+  }
+
+  /** Paint one frame. `hover` is the pointer in logical coords, or null. */
+  function draw(state, screen, best, bestWave, muted, hover) {
+    stateRef = state;
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.fillStyle = PALETTE.backdrop;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    const shakeX = state.shake > 0 ? (Math.random() - 0.5) * state.shake : 0;
+    const shakeY = state.shake > 0 ? (Math.random() - 0.5) * state.shake : 0;
+    context.setTransform(view.scale, 0, 0, view.scale, view.x + shakeX * view.scale, view.y + shakeY * view.scale);
+    drawField(state);
+    drawShards(state);
+    drawOrbs(state);
+    drawBlades(state);
+    drawShots(state);
+    for (const e of state.enemies) if (e.active) drawEnemy(e, state.time);
+    drawPlayer(state, state.time);
+    drawZapsAndRings(state);
+    drawParticles(state);
+    if (screen === SCREEN_TITLE) {
+      drawHud(state, best, muted);
+      drawTitle(state, best, bestWave, hover);
+    } else if (screen === SCREEN_HOWTO) {
+      drawHud(state, best, muted);
+      drawHowto(hover);
+    } else if (screen === SCREEN_PLAY) {
+      drawHud(state, best, muted);
+    } else if (screen === SCREEN_PAUSED) {
+      drawHud(state, best, muted);
+      drawPaused(hover);
+    } else if (screen === SCREEN_LEVELUP) {
+      drawHud(state, best, muted);
+      if (state.choices) drawLevelUp(state, hover);
+    } else if (screen === SCREEN_OVER) {
+      drawHud(state, best, muted);
+      drawOver(state, best, hover);
+    } else if (screen === SCREEN_WIN) {
+      drawHud(state, best, muted);
+      drawWin(state, best, hover);
+    }
+  }
+
+  resize();
+  window.addEventListener('resize', resize);
+
+  return {
+    draw,
+    /** CSS-pixel pointer position → logical playfield coords. */
+    toLogical(cssX, cssY) {
+      return {
+        x: (cssX * view.cssScale - view.x) / view.scale,
+        y: (cssY * view.cssScale - view.y) / view.scale,
+      };
+    },
+  };
+}
+
+// ---- shots.js ----
+// The screenshot scenes behind ?shot=start|play|levelup|end. Each one plays the
+// real rules forward from a fresh world for a fixed number of steps, steered by
+// a simple autopilot (chase the nearest shard, keep clear of the nearest foe),
+// so the frame is what a real game looks like and the same seed always gives
+// the same frame.
+
+
+
+const START_SECONDS = 12;
+// 100 s = wave 3, ~12 s in: the mix is up (skitters, spitters, brutes, elites)
+// and the field is at its busiest. 34 s landed in the wave-1 lull (field
+// cleared, 8 s left on the timer); 55 s was wave 2 but thinner.
+const PLAY_SECONDS = 100;
+const LEVELUP_LIMIT_SECONDS = 150;
+const END_LIMIT_SECONDS = 300;
+
+/** Move toward the nearest shard, fleeing anything closer than 70px. */
+function autopilot(state) {
+  const p = state.player;
+  let shard = null;
+  let shardD = Infinity;
+  for (const s of state.shards) {
+    if (!s.active) continue;
+    const d = (s.x - p.x) ** 2 + (s.y - p.y) ** 2;
+    if (d < shardD) { shardD = d; shard = s; }
+  }
+  let foe = null;
+  let foeD = Infinity;
+  for (const e of state.enemies) {
+    if (!e.active) continue;
+    const d = (e.x - p.x) ** 2 + (e.y - p.y) ** 2;
+    if (d < foeD) { foeD = d; foe = e; }
+  }
+  let tx = p.x;
+  let ty = p.y;
+  if (foe && foeD < 70 * 70) {
+    tx = p.x + (p.x - foe.x);
+    ty = p.y + (p.y - foe.y);
+  } else if (shard) {
+    tx = shard.x;
+    ty = shard.y;
+  } else {
+    tx = FIELD.width / 2;
+    ty = FIELD.height / 2;
+  }
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 4) return { x: 0, y: 0 };
+  return { x: dx / len, y: dy / len };
+}
+
+/** Walk straight into the nearest foe: the end scene's hurried player. */
+function reckless(state) {
+  const p = state.player;
+  let foe = null;
+  let foeD = Infinity;
+  for (const e of state.enemies) {
+    if (!e.active) continue;
+    const d = (e.x - p.x) ** 2 + (e.y - p.y) ** 2;
+    if (d < foeD) { foeD = d; foe = e; }
+  }
+  if (!foe) return { x: 0, y: 0 };
+  const dx = foe.x - p.x;
+  const dy = foe.y - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return { x: dx / len, y: dy / len };
+}
+
+/**
+ * Set `world` to the named scene (start, play, levelup or end; any other name is
+ * start) and return the screen to draw over it and the best score to show.
+ */
+function stageShot(name, world) {
+  world.reset();
+  const state = world.state;
+  if (name !== 'play' && name !== 'levelup' && name !== 'end') {
+    for (let i = 0; i < START_SECONDS / STEP; i += 1) world.step(STEP, { x: 0, y: 0 }, false, true);
+    return { screen: SCREEN_TITLE, best: 12340 };
+  }
+  if (name === 'levelup') {
+    for (let i = 0; i < LEVELUP_LIMIT_SECONDS / STEP; i += 1) {
+      world.step(STEP, autopilot(state), false, false);
+      if (state.choices) break;
+      if (state.over) break;
+    }
+    if (state.choices) return { screen: SCREEN_LEVELUP, best: state.score };
+    return { screen: SCREEN_PLAY, best: state.score };
+  }
+  if (name === 'end') {
+    for (let i = 0; i < END_LIMIT_SECONDS / STEP; i += 1) {
+      if (world.step(STEP, reckless(state), false, false) & EVENT_OVER) break;
+    }
+    return { screen: SCREEN_OVER, best: state.score };
+  }
+  for (let i = 0; i < PLAY_SECONDS / STEP; i += 1) {
+    world.step(STEP, autopilot(state), false, false);
+    if (state.over) break;
+  }
+  return { screen: SCREEN_PLAY, best: state.score };
+}
+
+// ---- main.js ----
+// Boot and the one loop: input is read every frame, the world advances in fixed
+// 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
+// paints what is there. The game moves between seven screens: title, how-to,
+// play, paused, level-up, game over and victory.
+//
+// ?seed=N fixes the random pattern. ?shot=start|play|levelup|end (with &seed=N)
+// stages that scene instead of running the loop, keeps painting it, and sets
+// window.__shotReady for a screenshot. ?debug=1 starts a boosted run at wave 9
+// (a testing shortcut, never part of normal play). ?fps=1 shows a frame-rate
+// counter.
+
+
+
+
+
+
+
+/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
+const MAX_FRAME = 0.25;
+
+const params = new URLSearchParams(window.location.search);
+const shot = params.get('shot');
+const debug = params.get('debug') === '1';
+const showFps = params.get('fps') === '1';
+const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+
+const canvas = document.getElementById('game');
+const status = document.getElementById('status');
+const audio = createAudio();
+const world = createWorld(createRandom(seed), audio);
+const renderer = createRenderer(canvas);
+
+function readBest(key) {
+  try {
+    return Number.parseInt(window.localStorage.getItem(key) ?? '0', 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveBest(key, value) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // Storage can be off (private windows): the best then lasts this visit only.
+  }
+}
+
+function runShot(name) {
+  const scene = stageShot(name, world);
+  let painted = 0;
+  function paint() {
+    renderer.draw(world.state, scene.screen, scene.best, 3, false, null);
+    painted += 1;
+    if (painted === 2) window.__shotReady = true;
+    // Keep repainting: a window resize clears the canvas, and the scene must
+    // still be on it whenever the screenshot is taken, not just on frame two.
+    requestAnimationFrame(paint);
+  }
+  requestAnimationFrame(paint);
+}
+
+function runGame() {
+  const input = createInput(canvas);
+  let screen = SCREEN_TITLE;
+  let best = readBest(BEST_KEY);
+  let bestWave = readBest(BEST_WAVE_KEY);
+  let accumulator = 0;
+  let last = performance.now();
+  let dashQueued = false;
+  let fpsFrames = 0;
+  let fpsTime = 0;
+  let fps = 0;
+
+  // Screen readers (and anyone watching the page's text) hear the screen changes.
+  function announce(message) {
+    status.textContent = message;
+  }
+
+  function startGame() {
+    audio.unlock();
+    world.reset();
+    accumulator = 0;
+    screen = SCREEN_PLAY;
+    announce('Playing. Survive ten waves.');
+  }
+
+  function toTitle() {
+    world.reset();
+    screen = SCREEN_TITLE;
+    announce('Lumenfall. Press Space or click Start to play.');
+  }
+
+  function finishRun(won) {
+    const s = world.state;
+    if (s.score > best) {
+      best = s.score;
+      saveBest(BEST_KEY, best);
+    }
+    if (s.wave > bestWave) {
+      bestWave = s.wave;
+      saveBest(BEST_WAVE_KEY, bestWave);
+    }
+    screen = won ? SCREEN_WIN : SCREEN_OVER;
+    if (won) audio.victory();
+    else audio.gameOver();
+    announce(won
+      ? `Victory. Score ${s.score}. Best ${best}.`
+      : `Game over on wave ${s.wave}. Score ${s.score}. Best ${best}.`);
+  }
+
+  function applyPick(index) {
+    const choices = world.state.choices;
+    if (!choices || index < 0 || index >= choices.length) return;
+    const result = world.applyLevelChoice(choices[index]);
+    announce(result.label);
+    if (!result.choices) screen = SCREEN_PLAY;
+  }
+
+  function handleClick(logical) {
+    if (screen === SCREEN_TITLE) {
+      const layout = titleLayout();
+      for (const b of layout.buttons) {
+        if (hit(b, logical.x, logical.y)) {
+          if (b.id === 'start') startGame();
+          else if (b.id === 'howto') screen = SCREEN_HOWTO;
+          return;
+        }
+      }
+      if (hit(layout.mute, logical.x, logical.y)) {
+        audio.unlock();
+        audio.toggleMute();
+      }
+    } else if (screen === SCREEN_HOWTO) {
+      for (const b of howtoLayout().buttons) {
+        if (hit(b, logical.x, logical.y) && b.id === 'back') screen = SCREEN_TITLE;
+      }
+    } else if (screen === SCREEN_PAUSED) {
+      for (const b of pauseLayout().buttons) {
+        if (!hit(b, logical.x, logical.y)) continue;
+        if (b.id === 'resume') screen = SCREEN_PLAY;
+        else if (b.id === 'restart') startGame();
+        else if (b.id === 'quit') toTitle();
+        return;
+      }
+    } else if (screen === SCREEN_LEVELUP) {
+      for (const card of levelUpLayout(world.state.choices ?? []).cards) {
+        if (hit(card.rect, logical.x, logical.y)) {
+          applyPick(card.index);
+          return;
+        }
+      }
+    } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
+      const layout = screen === SCREEN_OVER ? overLayout() : winLayout();
+      for (const b of layout.buttons) {
+        if (!hit(b, logical.x, logical.y)) continue;
+        if (b.id === 'again') startGame();
+        else if (b.id === 'title') toTitle();
+        return;
+      }
+    }
+  }
+
+  function handleActions() {
+    const actions = input.takeActions();
+    const pick = input.takePick();
+    const click = input.takeClick();
+    if (actions & ACTION_DASH) dashQueued = true;
+    if (click) handleClick(renderer.toLogical(click.x, click.y));
+    if (actions & ACTION_MUTE) {
+      audio.unlock();
+      audio.toggleMute();
+    }
+    if (screen === SCREEN_LEVELUP) {
+      if (pick > 0) applyPick(pick - 1);
+      return;
+    }
+    if (actions & ACTION_CONFIRM) {
+      if (screen === SCREEN_TITLE) startGame();
+      else if (screen === SCREEN_HOWTO) screen = SCREEN_TITLE;
+      else if (screen === SCREEN_OVER || screen === SCREEN_WIN) startGame();
+      else if (screen === SCREEN_PAUSED) screen = SCREEN_PLAY;
+    }
+    if (actions & ACTION_HOWTO && (screen === SCREEN_TITLE || screen === SCREEN_HOWTO)) {
+      screen = screen === SCREEN_TITLE ? SCREEN_HOWTO : SCREEN_TITLE;
+    }
+    if (actions & ACTION_PAUSE) {
+      if (screen === SCREEN_PLAY) {
+        screen = SCREEN_PAUSED;
+        announce('Paused.');
+      } else if (screen === SCREEN_PAUSED) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
+    }
+    if (actions & ACTION_RESTART && (screen === SCREEN_PLAY || screen === SCREEN_PAUSED || screen === SCREEN_OVER || screen === SCREEN_WIN)) {
+      startGame();
+    }
+  }
+
+  function step() {
+    if (screen === SCREEN_TITLE || screen === SCREEN_HOWTO) {
+      world.step(STEP, { x: 0, y: 0 }, false, true);
+      return;
+    }
+    if (screen !== SCREEN_PLAY) return;
+    const move = input.move();
+    const dash = dashQueued;
+    dashQueued = false;
+    const events = world.step(STEP, move, dash, false);
+    if (events & EVENT_WIN) finishRun(true);
+    else if (events & EVENT_OVER) finishRun(false);
+    else if (events & EVENT_LEVELUP) {
+      screen = SCREEN_LEVELUP;
+      announce(`Level ${world.state.player.level}. Choose an upgrade.`);
+    }
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const frameDt = Math.min((now - last) / 1000, MAX_FRAME);
+    last = now;
+    if (showFps) {
+      fpsFrames += 1;
+      fpsTime += frameDt;
+      if (fpsTime >= 0.5) {
+        fps = Math.round(fpsFrames / fpsTime);
+        fpsFrames = 0;
+        fpsTime = 0;
+      }
+    }
+    // Dash is a one-shot press: take it here, once per frame, and hand it to the steps.
+    handleActions();
+    if (screen === SCREEN_TITLE || screen === SCREEN_HOWTO || screen === SCREEN_PLAY) {
+      accumulator += frameDt;
+      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_HOWTO || screen === SCREEN_PLAY)) {
+        step();
+        accumulator -= STEP;
+      }
+      if (accumulator > STEP * 4) accumulator = 0;
+    } else {
+      accumulator = 0;
+    }
+    const hover = renderer.toLogical(input.pointer.x, input.pointer.y);
+    renderer.draw(world.state, screen, best, bestWave, audio.muted, hover);
+    if (showFps) {
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.font = '16px monospace';
+      ctx.fillStyle = '#7df9ff';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${fps} fps`, 12, 24);
+    }
+  }
+
+  // Leaving the tab pauses a running game rather than letting the swarm feed unseen.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && screen === SCREEN_PLAY) {
+      screen = SCREEN_PAUSED;
+      announce('Paused.');
+    }
+  });
+
+  if (debug) {
+    world.debugBoost();
+    screen = SCREEN_PLAY;
+    announce('Debug run at wave 9.');
+  } else {
+    announce('Lumenfall. Press Space or click Start to play.');
+  }
+
+  // A handle for automated testing (Playwright/puppeteer): read-only state, never used by the game.
+  window.__lumenfall = {
+    world,
+    screen: () => screen,
+    best: () => best,
+    fps: () => fps,
+  };
+
+  requestAnimationFrame(frame);
+}
+
+if (shot) runShot(shot);
+else runGame();
+</script>
+</body>
+</html>
