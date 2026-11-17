@@ -1,0 +1,6 @@
+{
+  "name": "lumenfall",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" }
+}
