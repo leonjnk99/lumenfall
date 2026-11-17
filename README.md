@@ -1,5 +1,11 @@
 # LUMENFALL — Neon Survivor
 
+[![make.fun · best-game-01](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![rank](https://make.fun/badge/best-game-01/leonjnk99/lumenfall/rank.svg)](https://make.fun/bounty/best-game-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![reward](https://make.fun/badge/best-game-01/leonjnk99/lumenfall/reward.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+
+Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=best-game-01) — see the [best-game-01 bounty](https://make.fun/bounty/best-game-01).
+
 An original top-down 2D arena survival game for the make.fun
 **best-game-01** bounty ("Make the best game", $1,000). Written in vanilla
 JavaScript ES modules on a `<canvas>`, with all art and sound generated in
